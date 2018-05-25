@@ -1,0 +1,988 @@
+---
+title: "Predicting Excitement at DonorsChoose.org"
+output:
+  html_document:
+    fig_caption: yes
+    fig_height: 3.5
+    fig_width: 5
+    number_sections: yes
+    toc: yes
+---
+<style>
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r setup, echo=FALSE, cache=FALSE}
+knitr::opts_knit$set(root.dir='/mnt/ssd/kdd', size="small")
+options(width=110)
+```
+
+
+# Introduction
+
+"[DonorsChoose.org](DonorsChoose.org) is an online charity that makes it easy to help students in need through school donations. At any time, thousands of teachers in K-12 schools propose projects requesting materials to enhance the education of their students."
+
+![https://www.donorschoose.org/project/tablets-for-collaborative-and-immersive/3208685/](donorschoose_proj.png)
+
+The [given challenge](https://www.kaggle.com/c/kdd-cup-2014-predicting-excitement-at-donors-choose) is to help DonorsChoose by predicting which projects are likely to be "exciting", where exciting is a business construct meaning that the project will:
+
+* Be fully funded
+* Have at least one donor referred by a teacher
+* Have a high percentage of donors leaving an original message
+* Have at least one donation made with the desired payment means
+* Have donations from certain desirable donors
+
+To try to predict whether a project will become exciting or not, we are given a substantial amount of data about each project, including:
+
+* Various structured information about each project, filled when the teachers submit the projects
+* Structured information about the resources requested for each project
+* Project text posted by the teachers (unstructured)
+* Information about the outcomes of projects in the training set
+* Information about the donations to each project in the training set
+
+# Instructions and Setup
+
+* This notebook was written with R Markdown in RStudio 1.1.
+* It was run with R 3.4.4 and also has pieces of code ran with Python 3.6.
+* To reproduce these results, the .rmd notebook file can be opened and run in RStudio.
+* Note that there are pieces of R code that take a long time to run (several hours). To be able to run this notebook relatively quickly, I saved the results that take a long time to compute, and those results are loaded instead of being run. The notebook is already configured to do that, but that requires the required .rdata files to be placed in the working directory.
+* In the setup code above, please set the working directory (root.dir) as needed.
+* To run the notebook, the .csv files of the challenge, as well as the 15zpallagi.csv file (provided in the GitLab repo), must also be placed in the working directory.
+
+Let's start by loading a few packages required for this notebook.
+```{r, message=FALSE}
+library(data.table)  # the best and fastest package for data manipulation
+library(ggplot2)     # the widely used and acknowledged plotting system
+theme_set(theme_bw(base_size=9))
+library(parallel)    # parallel computation package for speeding up some operations
+library(tm)          # NLP / needs package libxml2-dev in Ubuntu 16.04, available through apt-get install
+library(topicmodels) # NLP / needs package libgsl-dev in Ubuntu 16.04, available through apt-get install
+```
+
+# Data loading and cleaning
+
+## Projects data: projects.csv
+
+```{r}
+projects <- fread("projects.csv", na.strings="")
+```
+The file containing the key information about each project. It has a total of `r nrow(projects)` instances, and `r ncol(projects)` features.
+The list and description of each feature can be found [here](https://www.kaggle.com/c/kdd-cup-2014-predicting-excitement-at-donors-choose/data).
+
+Let's check what the features look like, and which ones are usables, by looking at the unique values in which one. This function counts the number of unique values, and if fewer than the given threshold, it shows the unique values sorted by frequency.
+```{r}
+uniquevals <- function(feature, tablelim=100) {
+  u <- length(unique(feature))
+  if(is.numeric(feature)) {
+    return(paste("Numeric. Unique values:",u))
+  }
+  if(u <= tablelim) {
+    return(sort(table(feature, useNA="ifany"), decreasing=T))
+  } else {
+    return(paste0("Categorical. Unique values:",u))
+  }
+}
+lapply(projects, uniquevals)
+```
+
+We can identify a number of features that will be unusable (categorical with too many values) or irrelevant (ids) for classification. We won't remove them from the data until the last step though, because they might be useful for future feature engineering.
+```{r}
+nonusable <- c("projectid","teacher_acctid","schoolid","school_ncesid","school_latitude","school_longitude",
+               "school_city","school_zip","school_district","school_county","date_posted","total_price_including_optional_support")
+usable <- setdiff(colnames(projects),nonusable)
+```
+
+We could also see that there was some missing data, and some categorical features with levels that were extremely rare. Let's fix that.
+```{r}
+projects[is.na(school_metro), school_metro := "unknown"]  # 81908 ocurrences, more than the least frequent category
+projects[teacher_prefix%in%c("Mr. & Mrs.","Dr."), teacher_prefix := NA]  # just 2, 4, 12 occurrences
+projects[is.na(secondary_focus_subject), secondary_focus_subject := "unknown"]  # 207893 occurrences, more than any other
+projects[is.na(secondary_focus_area), secondary_focus_area := "unknown"]  # 207893 occurrences, more than any other
+projects[, fulfillment_labor_materials := as.character(fulfillment_labor_materials)]  # this is actually a categorical variable
+projects[is.na(fulfillment_labor_materials), fulfillment_labor_materials := "unknown"]  # 35082 occurrences
+
+impute <- function(x) {
+  if(is.numeric(x)) { # median
+    x[is.na(x)] <- median(x, na.rm = TRUE)
+  } else { # most frequent
+    x[is.na(x)] <- names(which.max(table(x)))
+  }
+  return(x)
+}
+projects[, (usable) := lapply(.SD, impute), .SDcols=usable]
+```
+
+Now we'll fix the types of the columns, and check how it looks.
+```{r}
+projects[, date_posted := as.Date(date_posted)]
+projects[, school_zip := as.numeric(school_zip)]
+categorical_variables <- usable[sapply(projects[,usable,with=F],is.character)]
+numeric_variables <- usable[sapply(projects[,usable,with=F],is.numeric)]
+projects[,(categorical_variables) := lapply(.SD, function(x){factor(x)}), .SDcols=categorical_variables]    
+summary(projects)
+```
+
+Looking good! We're done cleaning up the projects data.
+
+## Outcomes data: outcomes.csv
+
+Let's load the data, check how it looks, and transform the categorical/binary variables to factors.
+
+```{r}
+outcomes <- fread("outcomes.csv", na.strings="")
+categorical_variables = setdiff(colnames(outcomes)[sapply(outcomes,is.character)], "projectid")  # exclude the projectid
+outcomes[,(categorical_variables) := lapply(.SD, factor), .SDcols=categorical_variables]    
+summary(outcomes)
+```
+
+Lots of NAs in some variables, always the same number (94398). We can also see that all of them correspond to non-exciting projects. There is no provided information on these cases, so let's assume that there is some problem with this data and discard it. We don't want potentially bad data for training. Also, we can see that we already have way more non-exciting projects than exciting, we don't need more of these.
+```{r}
+outcomes <- outcomes[!is.na(at_least_1_green_donation)]
+summary(outcomes)
+```
+
+There are still some NA's in great_messages_proportion. We have no info on this, so let's assume that NA in great_messages_proportion means no messages at all, and so let's impute zero.
+```{r}
+outcomes[is.na(great_messages_proportion), great_messages_proportion := 0]
+```
+
+And we're done with the outcomes data.
+
+## Merge projects and outcomes
+
+We are now ready to merge the projects and outcomes data.
+
+```{r}
+merged <- merge(projects, outcomes, by="projectid", all.x=T)
+```
+
+Let's check the time span of the date we have. Remember that the objective is to predict the outcome of new projects, so if the outcomes changed considerably through time, we shouldn't use old data.
+
+```{r}
+absolute <- merged[!is.na(is_exciting), .N, by=.(year(date_posted),month(date_posted),is_exciting)]
+ggplot(absolute, aes(as.Date(paste0(year,"-",month,"-01")),N,group=is_exciting)) +
+  geom_line(aes(colour=is_exciting)) + labs(x="Date") + ggtitle("Number of exciting/non-exciting projects over time")
+
+ratio <- merged[!is.na(is_exciting), sum(is_exciting=="t")/.N, by=.(year(date_posted),month(date_posted))]
+ggplot(ratio, aes(as.Date(paste0(year,"-",month,"-01")), V1)) +
+  geom_line() + labs(x="Date", y="Exciting/Total") + ggtitle("Ratio of exciting over time")
+```
+
+We can see that projects only started to get exciting around 2010, quickly rising and then becoming relatively stable in 2011. So, let's only use the data from 2011 onwards.
+
+```{r}
+merged <- merged[date_posted >= as.Date("2011-01-01")]
+```
+
+
+## Looking at some features
+
+To better grasp the problem at hand, let's also look at some categorical features that intuitively seem relevant for predicting excitment.
+
+```{r}
+by_area = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(primary_focus_area)]
+ggplot(by_area, aes(primary_focus_area, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per Primary focus area") + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+by_poverty = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(poverty_level)]
+by_poverty[, poverty_level := factor(poverty_level, labels=paste(c("highest","high","moderate","low"),"poverty"))]
+ggplot(by_poverty, aes(poverty_level, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per school's area poverty level") + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+by_res = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(resource_type)]
+ggplot(by_res, aes(resource_type, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per requested resource type") + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+by_grade = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(grade_level)]
+by_grade[, grade_level := relevel(grade_level, "Grades PreK-2")]
+ggplot(by_grade, aes(grade_level, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per grade level") + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+by_state = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(school_state)]
+ggplot(by_state, aes(school_state, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per state") + theme(axis.text.x=element_text(angle=90, hjust=1))
+```
+
+
+## Preparing the data for model building
+
+I will train the models in Python, so the data needs to be exported. The exportData function exports separate files for the training X (feature vectors) and y (target vector) data, and also exports the test data that is needed to make a submission to the Kaggle challenge.
+```{r}
+exportData <- function(dt, basename="data", yvars="is_exciting", excludevars=c()) {
+  outdata <- copy(dt)
+  setorder(outdata, date_posted) # sort by date
+  # all binary variables (f/t) become 0/1's
+  binary_vars <- colnames(outdata)[sapply(outdata, function(x){is.factor(x) & length(levels(x))==2})]
+  outdata[,(binary_vars) := lapply(.SD, function(x){as.numeric(x)-1}), .SDcols=binary_vars]    
+
+  # remove outcome vars from the X data, as well as other non-wanted features
+  # and ensure projectid always comes first
+  train_x <- outdata[complete.cases(outdata),
+                     c("projectid", setdiff(names(outdata), c(yvars, excludevars))), with=F]
+  # projectid always comes first
+  train_y <- outdata[complete.cases(outdata),
+                     c("projectid", setdiff(yvars,"projectid")), with=F]
+  # also export the data for Kaggle challenge
+  testprojects <- fread("sampleSubmission.csv")
+  test_x <- outdata[projectid %in% testprojects$projectid,
+                    c("projectid", setdiff(names(outdata), c(yvars, excludevars))), with=F]
+
+  # write to files
+  write.csv(train_x, file=paste0("train_x_",basename,".csv"), row.names=F)
+  write.csv(train_y, file=paste0("train_y_",basename,".csv"), row.names=F)
+  write.csv(test_x, file=paste0("test_x_",basename,".csv"), row.names=F)
+  rm(outdata, train_x, test_x, train_y)
+}
+
+exportData(merged, basename="basic", yvars=colnames(outcomes), excludevars=nonusable)
+```
+
+
+# Model building in Python
+
+I'll use Python to build and evaluate the models, relying on the **sklearn**. The motivation for using Python is that there is a single package (sklearn) with many different models implemented, as well as metrics, preprocessing techniques, and so on. On **R**, this would have to be done with a variety of packages, which is not as clear and is more difficult to use.
+
+## Data loading and transformation
+
+Let's start by defining a function in Python that will be useful for loading the data. It transforms each categorical feature in a set of dummy variables, using one-hot encoding.
+```{python, eval=FALSE}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, auc, roc_curve
+from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import StandardScaler
+
+def dataload(name,folder='/mnt/ssd/kdd/'):
+    X = pd.read_csv(folder + 'train_x_'+ name + '.csv')
+    X.drop('projectid', axis=1, inplace=True)
+
+    X_master = pd.read_csv(folder + 'test_x_'+ name + '.csv')
+    X_master.drop('projectid', axis=1, inplace=True)
+
+    # joining the train with the test data to ensure that the
+    # one-hot-encoding is consistent in both
+    # this should be redone using one OneHotEncoder per categorical feature
+    joined = pd.concat((X, X_master), axis=0)
+    joined = pd.get_dummies(joined, drop_first=True)
+
+    # Now splitting them again
+    X_master = joined.iloc[-X_master.shape[0]:]
+    X = joined.iloc[:-X_master.shape[0]]
+    y = pd.read_csv(folder + 'train_y_' + name + '.csv')
+    y = y['is_exciting']
+
+    # Double-check that are no NaN values anywhere
+    if len(X[X.isnull().T.any().T]) > 0:
+        raise Exception("NaN values in X")
+    if len(X_master[X_master.isnull().T.any().T]) > 0:
+        raise Exception("NaN values in X test")
+
+    return X, y, X_master
+```
+
+Now, a function to split the data into training and test data. The test data is the **20%** most recent data. The objective of the model is to predict the outcome of future projects, so it makes sense that the training/test is also split that way. The performance of the model on the test data should be a good indicator of its performance in a real application scenario.
+```{python, eval=FALSE}
+def splitdata(X, y, test_split=0.2):
+    # split into train and test
+    lim = int((1 - test_split) * X.shape[0])
+    # the test data is the most recent data
+    # we're trying to predict future outcomes, so this is the most accurate model assessment
+    X_train = X.iloc[:lim, ]
+    y_train = y.iloc[:lim, ]
+    X_test = X.iloc[lim:, ]
+    y_test = y.iloc[lim:, ]
+    return X_train, y_train, X_test, y_test
+
+```
+
+The dataset contains features with widely disparate value ranges, so let's standardize the features. Min-max scaling could be problematic, as we've seen some outliers in a number of features. So, I'm standardizing based on the mean and standard deviation.
+```{python, eval=FALSE}
+def featurescaling(X, sc=None):
+    # Feature Scaling: mean and stdev scaling
+    if sc==None:
+        sc = StandardScaler()
+        X = sc.fit_transform(X)
+    else:
+        X = sc.transform(X)
+    if not np.isfinite(X.all()):
+        raise Exception('Found non-finite values')
+
+    return X, sc
+```
+
+Finally, a convenience function that loads and transforms the data as needed for feeding to the model training.
+```{python, eval=FALSE}
+def load_and_transform(name, folder='/mnt/ssd/kdd/', split=0.2):
+    X, y, Xm = dataload(name, folder=folder)
+    Xtr, ytr, Xte, yte = splitdata(X, y, test_split=split)
+    # only using the train data for computing the standardization coefficients
+    Xtr, sc = featurescaling(Xtr)
+    if len(Xte) > 0:
+      Xte, _ = featurescaling(Xte, sc)
+    Xm, _ = featurescaling(Xm, sc)
+    return Xtr, ytr, Xte, yte, Xm
+```
+
+## Model assessment
+
+As stated above, the test data is the most recent data, that will not be seen by the model. Cross-validation for assessing the model's performance should not be needed in this scenario, as we would be using new projects to predict the outcome of old projects, which does not match to the intended application. And cross-validation is also computationally expensive, which can be problematic given that we have a huge amount of data and features.
+
+The data is largely imbalanced, with only around 15% of the projects belonging to the class of *exciting project*. The metrics used for assessing the model should therefore be insensitive to class imbalance. For instance, a model that classifies everything as non-exiciting would obtain a relatively high accuracy, but it is completely useless. The chosen metrics are not affected by class imbalance:
+
+1. **Confusion matrix**. Considering a threshold of 0.5, that is, instances with probabilities below 0.5 are considered non-exiciting, and above that are considered exciting.
+2. Metrics computed from the confusion matrix: **True Positive Rate** (when it's actually exciting, how often does it predict exciting), **False Positive Rate** (when it's actually not-exciting, how often does it predict exciting), and **Precision** (when it predicts exciting, how often is it correct).
+3. **ROC curve**. The Receiver Operating Characteristic curve plot has the true positive rate on the Y axis, and the false positive rate on the X axis. This means that the top left corner of the plot is the ideal point: a false positive rate of zero, and a true positive rate of one. The higher the steepness of the curve the better, meaning that it maximizes the true positive rate while minimizing the false positive rate.
+4. **ROC-AUC score**. The area under the ROC curve. The higher, the better, ranging from 0.5 (random guess) to 1 (perfect predictions).
+
+I've defined a convenience function for assessing the model's performance:
+```{python, eval=FALSE}
+def assessmodel(model, X_test, y_test):
+    y_prob = model.predict_proba(X_test)[:,1]
+    y_pred = y_prob > 0.5 # cutoff
+    cm = confusion_matrix(y_test, y_pred)
+    print('Confusion matrix:\n' + str(cm))
+    # True Positive Rate: When it's actually yes, how often does it predict yes?
+    tpr = cm[1, 1] / (cm[1, 0] + cm[1, 1])
+    # False Positive Rate: When it's actually no, how often does it predict yes?
+    fpr = cm[0, 1] / (cm[0, 0] + cm[0, 1])
+    # Precision: When it predicts yes, how often is it correct?
+    precision = cm[1, 1] / (cm[0, 1] + cm[1, 1])
+    print('True Positive Rate:', round(tpr, 2))
+    print('False Positive Rate:', round(fpr, 2))
+    print('Precision:', round(precision, 2))
+    auc = roc_auc_score(y_test, y_prob)
+    print('ROC AUC score: ' + str(auc))
+    # ROC curve
+    fpr,tpr,_ = roc_curve(y_test, y_prob)
+    plt.plot(fpr, tpr, color='blue', label='ROC curve')
+    plt.plot([0, 1], [0, 1], color='black', linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.legend()
+    plt.show()
+```
+
+## Model building
+
+The target for training the model is the *is_exciting* binary variable. This means we're treating this as a binary classification problem, where the model should output the probability of the project being exciting.
+
+As a baseline, I chose to use a Logistic Regression model, with L1 (Lasso) regularization. Logistic Regression is the go-to method for binary classification. There is a rather large number of features in the training data, and it is relatively sparse, due to the categorical variables that were one-hot-encoded. For instance, the school state alone corresponds to 50 features in the training data. Since there is not enough time to due proper feature selection in order to try to reduce the number of features, I will instead defer that task to the model. Logistic Regression with L1 regularization is capable of performing feature selection, and hence it was my choice for a base model.
+
+```{python, eval=FALSE}
+def fitLRmodel(X, y):
+    from sklearn.linear_model import LogisticRegression
+    # Balanced class_weight because we have way more non-exciting than exciting
+    lr = LogisticRegression(penalty='l1', class_weight='balanced', verbose=1)
+    lr.fit(X, y)
+    return lr
+```
+
+The parameters of the model itself were mostly left untouched. The only exception is *class_weight*, which is set to *balanced*. This parameter dictates the weights associated with each class. The *balanced* option automatically computes the weights so that they are inversely proportional to class frequencies in the input data. This is important since in the training data the classes are largely imbalanced. Not addressing this imbalance could result in models that are biased towards negative predictions (non exciting), as this is by far the most common class. Tuning other parameters such as the *C* value (regularization strength) could lead to better models, but that would require a careful evaluation, possible with cross-validation, which would take some time to perform.
+
+## Training the model with the basic dataset
+
+Let's see how the model performs using the data we have so far.
+
+```{python, eval=FALSE}
+X_train, y_train, X_test, y_test, X_master = load_and_transform('basic', split=0.2)
+lr1 = fitLRmodel(X_train, y_train)
+assessmodel(lr1, X_test, y_test)
+```
+
+```
+# nonzeros / # features = 137/146
+Confusion matrix:
+[[35949 12992]
+ [ 4838  3222]]
+True Positive Rate: 0.4
+False Positive Rate: 0.27
+Precision: 0.2
+ROC AUC score: 0.5968095858369598
+```
+
+![ROC curve](basic_roc.png)
+
+The performance of the model is, overall, relatively weak. The true positive rate is rather high, meaning that 40% of the projects that are actually exciting are being predicted as so. But the model is giving a large amount of false positives, resulting in a very low precision. The value of just ~0.59 in the ROC-AUC score confirms the poor performance of the model.
+
+# Basic feature engineering
+
+To try to improve the model, let's proceed to extract aditional features from the existing data, which might help the model make more accurate predictions.
+
+## Time features
+
+It's concievable that the date the projects were posted influences their outcome. As we saw earlier, for instance, there was a slight upwards trend in the ratio of exciting projects. Also, it's possible that projects posted in certain times of the year are more likely to be successful. Let's extract a few features from the date_posted feature so that the posting date can also be used for learning.
+```{r}
+# year as numeric
+merged[, year_posted := year(date_posted)]
+# month as categorical, since non-linearities are likely
+merged[, month_posted := factor(months(date_posted, abbreviate=T))]
+# weekday as categorical because non-linearities are likely
+merged[, wday_posted := factor(weekdays(date_posted, abbreviate=T))]
+# day in the month as numeric to avoid an excess of categories
+merged[, day_posted := mday(date_posted)]
+```
+
+Let's look at some plots to understand eventual relations between the date posted and the project's success. It's clear there is some influence, mostly in the month. It makes sense: projects just before the school year begining tend to be more successful.
+```{r}
+by_month = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(month_posted)]
+by_month[, month_posted := factor(month_posted,
+                                  levels=c("Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"))]
+ggplot(by_month, aes(month_posted, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per month")
+
+by_wday = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(wday_posted)]
+by_wday[, wday_posted := factor(wday_posted,
+                                levels=c("Seg","Ter","Qua","Qui","Sex","Sáb","Dom"))]
+ggplot(by_wday, aes(wday_posted, ExcitingRatio)) + geom_bar(stat="identity") +
+  ggtitle("Ratio of exciting projects per weekday")
+
+by_mday = merged[!is.na(is_exciting), .(ExcitingRatio=sum(is_exciting=="t")/.N), by=.(day_posted)]
+ggplot(by_mday, aes(day_posted, ExcitingRatio)) + geom_line() +
+  ggtitle("Ratio of exciting projects per day in the month")
+```
+
+## Previous outcomes
+
+We have the schoolid and the teacherid in the projects data. While these cannot be used directly por classification, it is possible to use this data to see how many projects a school/teacher has submitted in the past, and the outcome of these projects. Intuitively, experience and success in submitting such projects in the past should be, to some degree, related to the success of future projects.
+```{r}
+if(file.exists("history.rdata")) {
+  # Results already previously computed
+  load("history.rdata")
+  merged <- merge(merged, history, by="projectid")  
+} else {
+  # This will take some time, let's parallelise to make this faster
+  cl <- makeCluster(detectCores())
+  clusterEvalQ(cl, library(data.table))
+  clusterExport(cl, list("merged"))
+  
+  # Previously submitted and successful projects from the school
+  count_school <- function(x){
+    sum(merged$schoolid==x["schoolid"] & merged$date_posted < x["date_posted"])
+  }
+  merged[, school_previous_submitted := parApply(cl, .SD, 1, count_school)]
+  count_school_success <- function(x){
+    sum(merged$is_exciting=="t" & merged$schoolid==x["schoolid"] & 
+          merged$date_posted < x["date_posted"])
+  }
+  merged[, school_previous_success := parApply(cl, .SD, 1, count_school_success)]
+  
+  # Previously submitted and successful projects from the teacher
+  count_teacher <- function(x){
+    sum(merged$teacher_acctid==x["teacher_acctid"] & 
+          merged$date_posted < x["date_posted"])
+  }
+  merged[, teacher_previous_submitted := parApply(cl, .SD, 1, count_teacher)]
+  count_teacher_success <- function(x){
+    sum(merged$is_exciting=="t" & merged$teacher_acctid==x["teacher_acctid"] & 
+          merged$date_posted < x["date_posted"])
+  }
+  merged[, teacher_previous_success := parApply(cl, .SD, 1, count_teacher_success)]
+  
+  # Let's save what we just calculated, as it will take some time to recompute it
+  history <- merged[,.(projectid,school_previous_submitted,school_previous_success,
+                       teacher_previous_submitted,teacher_previous_success)]
+  save(history, file="history.rdata")
+}
+```
+
+Let's see what these new features look like.
+```{r}
+summary(history[,-c("projectid")])
+```
+
+We can look at some correlations to try to validate the hypothesis that previous submissions are related with future outcomes. We can see some positive correlations with the number of previously successful projects, but negative correlations with the total number of previously submitted projects. These correlations are quite low though, so let's not jump to conclusions.
+```{r}
+m <- merged[complete.cases(merged)]
+cor(m$school_previous_success, as.numeric(m$is_exciting=='t'), method="spearman")
+cor(m$teacher_previous_success, as.numeric(m$is_exciting=='t'), method="spearman")
+cor(m$school_previous_submitted, as.numeric(m$is_exciting=='t'), method="spearman")
+cor(m$teacher_previous_submitted, as.numeric(m$is_exciting=='t'), method="spearman")
+rm(m)
+```
+
+
+## Resource data
+
+The projects.csv dataset has the main type of resource required by the project (resource_type feature), and that's the only knowledge about the resources we have so far. Let's look into the resources.csv data to see if we can extract some more valuable information.
+
+```{r}
+resources <- fread("resources.csv")
+resources <- resources[projectid %in% merged$projectid]  # the only data that is worth it
+head(resources, n=5)
+summary(resources[, .N, by=.(projectid)]$N)       # number of resources per project
+cats <- unique(resources$project_resource_type)   # project resource types
+# number of different resource types per project
+summary(resources[, .(U=length(unique(project_resource_type))), by=.(projectid)]$U)
+items <- length(unique(resources$item_name))      # number of different items
+```
+
+There are `r items` different items, for a total of `r nrow(resources)` resources. This is way too sparse, and thus not useful. We can also see that there's only one resource type per project, which corresponds to the resource type already in the resource_type feature in projects.csv, which makes this useless. Let's extract what we can: *average price of the resources in a project*, *average quantity per resource in a project*, *number of different resources required by the project*.
+```{r}
+resourcestats <- resources[, .(average_resource_price=mean(item_unit_price, na.rm=T),
+                               average_quantity=mean(item_quantity, na.rm=T),
+                               different_resources=.N), by=.(projectid)]
+merged <- merge(merged, resourcestats, by="projectid", all.x=TRUE)
+```
+
+Let's see what these new features look like.
+```{r}
+summary(resourcestats[,-c("projectid")])
+```
+
+Some missing data (very few), let's fix that.
+```{r}
+merged[, average_resource_price := impute(average_resource_price)]
+merged[, average_quantity := impute(average_quantity)]
+```
+
+## Re-evaluation
+
+Let's see if the results improved with the new features we added.
+```{r}
+exportData(merged, basename="feature_eng_simple", yvars=colnames(outcomes), excludevars=nonusable)
+```
+
+```{python, eval=FALSE}
+X_train, y_train, X_test, y_test, X_master = load_and_transform('feature_eng_simple', split=0.2)
+lr2 = fitLRmodel(X_train, y_train)
+assessmodel(lr2, X_test, y_test)
+```
+
+```
+# nonzeros / # features = 164/172
+Confusion matrix:
+[[37993 10948]
+ [ 4996  3064]]
+True Positive Rate: 0.38
+False Positive Rate: 0.22
+Precision: 0.22
+ROC AUC score: 0.6208175256143482
+```
+
+We can see that feature engineering worked. Compared to the previous model, we have approximately the same amount of false negatives, but we have 2000 fewer false positives. The False Positive Rate decreased from 0.27 to 0.22, the precision increased from 0.2 to 0.22, and the ROC-AUC score increased from 0.59 to 0.62.
+
+# Using additional data
+
+The results we got so far are slightly disappointing with respect to the accuracy of the model. There are two likely explanations for this:
+
+* The outcome of a project might be largely stochastic, and thus mostly unpredictable.
+* The model doesn't have enough information to make accurate predictions.
+
+We can't do much about the first hypohtesis, so let's go for the second. Let's try to gather additional information that might help predicting the outcome of a project.
+
+## Population data
+
+In the plots shown above, we can see that the project excitment ratio varies largely between states, and also slightly between different poverty levels. The working hypothesis is that the outcome of a project is influenced by the socio-economic context of the school. This is highly likely, as even the [donorschoose.org](https://www.donorschoose.org) highlights this information in the projects' pages:
+
+![Taken from the page of an arbitrary project: https://www.donorschoose.org/project/bounce-into-focus/3149021](donorschoose_income.png)
+
+The data we have in the dataset about the socio-economic context is very few, only the poverty_level attribute:
+```{r}
+table(merged$poverty_level)
+```
+
+We have the school zip code for each project, which in the US is a good indicator of the geographical area. After some digging, I found a very complete and accurate dataset with socio-economic data per zip code in the US, at the [irs.gov](https://www.irs.gov/) website: [Individual Income Tax Statistics - ZIP Code Data (SOI)](https://www.irs.gov/statistics/soi-tax-stats-individual-income-tax-statistics-zip-code-data-soi). Citing the source, the data includes items such as:
+
+* Number of returns, which approximates the number of households
+* Number of personal exemptions, which approximates the population
+* Adjusted gross income
+* ...
+
+A full description of the features (131 in total) can be found [here](http://www.nber.org/tax-stats/zipcode/2015/desc/zipcode2015/desc.txt).
+
+We are going to extract the following features:
+
+1. Number of households
+2. Total population number
+3. Total number of dependents
+4. Fraction of dependents: number of dependents / population number
+5. Relative distribution of the population over the 6 defined income classes
+
+```{r}
+tax <- fread("15zpallagi.csv")
+
+# N1: number of returns (approximates number of households)
+# agi_stub: adjusted gross income class
+# Calculate the proportion of returns in each income class
+income_distribution <- tax[,.(STATE,zipcode,agi_stub,N1)]
+income_distribution[, N1 := N1 / sum(N1), by=.(STATE,zipcode)]
+# From long to wide (one column per income class)
+income_distribution <- dcast(income_distribution, STATE + zipcode ~ agi_stub, value.var="N1")
+colnames(income_distribution) <- c("STATE","zipcode",paste0("agi",1:6))
+# N2: number of exemptions (approximates the population)
+# numdep: number of dependents (likely people in school age)
+totals <- tax[, .(households=sum(N1),population=sum(N2),dependents=sum(NUMDEP),
+                  fraction_dependents=sum(NUMDEP)/sum(N2)), by=.(STATE,zipcode)]
+ziptotals <- merge(totals,income_distribution,by=c("STATE","zipcode"))
+```
+
+We have the features we want per state and zipcode, let's see how it looks and merge it in our data.
+```{r}
+summary(ziptotals)
+sum(merged$school_zip %in% ziptotals$zipcode) # data for nearly all projects!
+
+merged <- merge(merged, ziptotals, by.x=c("school_zip","school_state"), by.y=c("zipcode","STATE"), all.x=TRUE)
+# there were very few cases for which zip codes were not found, impute medians of the state
+vars <- setdiff(colnames(ziptotals), c("STATE","zipcode"))
+merged[, (vars) := lapply(.SD, impute), by=.(school_state), .SDcols=vars]
+```
+
+We could have also easily extracted the state-wise data, but that wouldn't make much sense, as we are using the state itself directly as a feature.
+
+## Re-evaluation after socio-economic data
+
+Let's see if the results improved with the new features we added.
+```{r}
+exportData(merged, basename="feature_eng_census", yvars=colnames(outcomes), excludevars=nonusable)
+```
+
+```{python, eval=FALSE}
+X_train, y_train, X_test, y_test, X_master = load_and_transform('feature_eng_census', split=0.2)
+lr3 = fitLRmodel(X_train, y_train)
+assessmodel(lr3, X_test, y_test)
+```
+
+```
+# nonzeros / # features = 170/182
+Confusion matrix:
+[[37856 11081]
+ [ 4947  3117]]
+True Positive Rate: 0.39
+False Positive Rate: 0.23
+Precision: 0.22
+ROC AUC score: 0.6214096741364261
+```
+
+The improvement in the model's performance was minor with the new features. The ROC-AUC score increased from 0.6208 to 0.6214, which is marginal. It might be possible that the informatiom already contained in the original dataset (the *state* and the *poverty level*) was sufficient, and thus adding additional information about the school's location was irrelevant. Another hypothesis is that the model does not have enough power to handle this data, as there might be non-linear relations between the new features and the projects' outcome, which our Logistic Regression model is incapable of capturing.
+
+## Natural Language Processing for the project essays
+
+The data available for the projects also includes the complete project essays and statement needs (file essays.csv). Although the projects.csv data already has a few structured attributes that help categorize the projects (*primary_focus_area*, *primary_focus_subject*, *secondary_focus_subject*, *secondary_focus_area*) and their needs (*resource_type*), it is conceivable that the available categories do not accurately capture the diversity of the projects themes. It is also possible that projects using certain keywords are more likely to attract attention, regardless of the theme. To investigate these possibilities, I will try to extract useful knowledge from the essays file by using text mining techniques.
+
+The main idea is to use [probabilistic topic models](https://dl.acm.org/citation.cfm?id=2133826) to automatically extract topics from the given corpus (all the essays). After the topics are defined, we can then *classify* each essay against those topics, that is, what's the probability of a given essay belonging to each of those topics? These probabilities can then be used as features to train the model.
+
+This implementation described in this notebook is adapted from the guide available [here](https://eight2late.wordpress.com/2015/09/29/a-gentle-introduction-to-topic-modeling-using-r):
+
+1. Apply typical text minining techniques to cleanup the essays: remove punctuation and stop words, stem the words, and remove very frequent and unfrequent terms.
+2. Use topic modelling with a sample of the data to extract the topics, using the [LDA algorithm](https://en.wikipedia.org/wiki/Latent_Dirichlet_allocation) in particular.
+3. Use those topics to calculate the probabilities of each essay belonging to each topic.
+
+Note that the essays.csv file also as a *short_description* attribute, which could be more useful for this task. However, I noticed that most of the short descriptions were actually truncated in arbitrary places, ending with "...". These can compromise the results, so I am using the full project essay instead.
+
+First, let's define a function that will pre-process the essay texts to make it easier for the topic models.
+```{r}
+preProcessCorpus <- function(texts) {
+  # create corpus from the vector source
+  descrs <- Corpus(VectorSource(texts))
+  # to lower case
+  descrs <- tm_map(descrs,content_transformer(tolower))
+  # remove punctuation
+  descrs <- tm_map(descrs, removePunctuation)
+  descrs <- tm_map(descrs, removeNumbers)
+  # remove stopwords (and, to, with, etc, ...)
+  descrs <- tm_map(descrs, removeWords, stopwords("english"))
+  # remove whitespace
+  descrs <- tm_map(descrs, stripWhitespace)
+  # stem document (going -> go, documentation -> document, ...)
+  descrs <- tm_map(descrs,stemDocument)
+  return(descrs)
+}
+```
+
+Now, let's load the data and pre-process it.
+```{r}
+if(file.exists("essays_tm.rdata")) {
+  # Use the previously computed objects
+  # this loads the objects essayscorpus, essaysdtm, essayslda, essaysprobs
+  load("essays_tm.rdata")
+} else {
+  # Load the data -- the fread was not able to deal with the line brekage. read.csv works
+  essays <- read.csv("essays.csv", allowEscapes=TRUE, stringsAsFactors=FALSE)
+  setDT(essays)
+  # Use only the data that is worth it
+  essays <- essays[projectid %in% merged$projectid]
+  essayscorpus <- preProcessCorpus(essays$essay)
+}
+
+```
+
+Let's see what it looks like by looking at one random essay after the pre-processing.
+```{r}
+writeLines(as.character(essayscorpus[[1]]))
+```
+
+Second, let's extract the Document-Term-Matrix required for topic modelling. Note that in this operation I'm also removing the overly common terms (appearing in more than 90% of the documents), and the overly sparse terms (appearing in less than 1% of the documents). This is a common operation that helps keep the number of different terms in check.
+```{r}
+extractDTM <- function(corpus, ids) {
+  # create document-term matrix
+  ndocs <- length(descrs)
+  # ignore overly sparse terms (appearing in less than x% of the documents)
+  minDocFreq <- ndocs * 0.01
+  # ignore overly common terms (appearing in more than y% of the documents)
+  maxDocFreq <- ndocs * 0.90 
+  dtm <- DocumentTermMatrix(descrs, control=list(bounds=list(global=c(minDocFreq, maxDocFreq))))
+  # use the ids as rownames
+  rownames(dtm) <- ids
+  # Remove the empty entries (should be very few)
+  dtm = dtm[unique(dtm$i),]  
+  return(dtm)
+}
+if(!exists("essaysdtm")) { # previous results weren't available
+  essaysdtm <- extractDTM(essayscorpus, essays$projectid)
+}
+inspect(essaysdtm)
+```
+
+Third, let's extract the topics with probabilistic topic modelling. I had to sample the data that is used to make the models because this takes quite some time.
+```{r}
+if(!exists("essayslda")) { # previous results weren't available
+  essayslda <- LDA(essaysdtm[sample(1:nrow(essaysdtm),50000),], 50, method="Gibbs", 
+                   control=list(nstart=1, burnin=2000, iter=2000, verbose=1))
+}
+```
+
+After letting it run overnight, let's look at the fitted topics. I'm showing the terms with the higher probability of appearing for each of the fitted topics. We can immediately see that there a lot of topics that make sense here, looking good!
+```{r}
+terms(essayslda,6)
+```
+
+Fourth, let's calculate the probabilities of each essay belonging to each of the fitted topics. This also takes quite some time.
+```{r}
+if(!exists("essaysprobs")) { # previous results weren't available
+  essaysprobs <- posterior(essayslda, essaysdtm)$topics
+
+  # Lets save everything to reuse later
+  save(essayscorpus, essaysdtm, essayslda, essaysprobs, file="essays_tm.rdata")
+}
+```
+
+Finally, let's merge the probabilities into our dataset.
+```{r}
+essaysprobs_dt <- data.table(essaysprobs)
+cols <- paste0("essay_topic_",1:ncol(essaysprobs))
+colnames(essaysprobs_dt) <- cols
+essaysprobs_dt[, projectid := rownames(essaysdtm)]
+merged <- merge(merged, essaysprobs_dt, all.x=TRUE, by="projectid")
+# Handle NA's (very few, caused by lack of essay) - impute uniform probabilities
+imputeuniform <- function(x, ncols){
+  x[is.na(x)] <- 1 / ncols
+  return(x)
+}
+merged[, (cols) := lapply(.SD, imputeuniform, length(cols)), .SDcols=cols]
+```
+
+Now let's do the same for the needs statement.
+```{r}
+if(file.exists("needs_tm.rdata")) {
+  # Load the already computed results
+  load("needs_tm.rdata")
+} else {
+  needscorpus <- preProcessCorpus(essays$need_statement)
+  needsdtm <- extractDTM(needscorpus, essays$projectid)
+  needslda <- LDA(needsdtm[sample(1:nrow(needsdtm),50000),], 30, 
+                  method="Gibbs", control=list(nstart=1, burnin=2000, iter=2000, verbose=1))
+  needsprobs <- posterior(needslda, needsdtm)$topics
+  save(needscorpus, needsdtm, needslda, needsprobs, file="needs_tm.rdata")
+}
+
+```
+
+Let's take a look at the extracted topics. I used 30 topics instead of 50 since there are much fewer different terms in the needs statements. 
+```{r}
+inspect(needsdtm) # the most frequent terms in the corpus
+terms(needslda,6) # the 6 most likely terms for each topic
+```
+
+And finally, merge this into our data.
+```{r}
+needsprobs_dt <- data.table(needsprobs)
+cols <- paste0("needs_topic_",1:ncol(needsprobs))
+colnames(needsprobs_dt) <- cols
+needsprobs_dt[, projectid := rownames(needsdtm)]
+merged <- merge(merged, needsprobs_dt, all.x=TRUE, by="projectid")
+merged[, (cols) := lapply(.SD, imputeuniform, length(cols)), .SDcols=cols]
+```
+
+## Re-evaluation after NLP
+
+And now export the data with these new features. It's time to check if all this work improved the predictions.
+```{r}
+exportData(merged, basename="feature_eng_nlp", yvars=colnames(outcomes), excludevars=nonusable)
+```
+
+```{python, eval=FALSE}
+X_train, y_train, X_test, y_test, X_master = load_and_transform('feature_eng_nlp', split=0.2)
+lr4 = fitLRmodel(X_train, y_train)
+assessmodel(lr4, X_test, y_test)
+```
+
+```
+# nonzeros / # features = 248/262
+Confusion matrix:
+[[37463 11478]
+ [ 4837  3223]]
+True Positive Rate: 0.4
+False Positive Rate: 0.23
+Precision: 0.22
+ROC AUC score: 0.6226416899509781
+```
+
+![ROC curve of the final model](final_roc.png)
+
+Again, the performance increase is mostly minor. The ROC-AUC score went from 0.621 to 0.622. The True Positive Rate increased from 0.39 to 0.4, and the other metrics remained at similar values as before.
+
+# Kaggle submission
+
+Finally, let's train the model with all the data and see how the model fares in the Kaggle competition.
+
+```{python, eval=FALSE}
+X_train, y_train, _, _, X_master = load_and_transform('feature_eng_nlp', split=0)
+lrfinal = fitLRmodel(X_train, y_train)
+pred = lrfinal.predict_proba(X_master)[:,1]
+
+# Write submission file
+ori = pd.read_csv('/mnt/ssd/kdd/test_x_feature_eng_nlp.csv') # get the projectids
+out_master = pd.DataFrame({'projectid':ori['projectid'].values,'is_exciting':pred})
+out_master= out_master[['projectid','is_exciting']] # sort the columns
+out_master.to_csv('data/kaggle.csv', sep=',', index=False) # write the submission file
+```
+
+![ROC-AUC score achieved in the test data used by the Kaggle competition](kaggle_result.png)
+
+The Kaggle competition uses the ROC-AUC score to assess the submissions. The score of 0.61361 is incredibly similar to the score of 0.622 that I achieved with my own test data. These are relatively poor results, but at least it means that the model is not overfitted to the training data.
+
+![Leaderboard of the Kaggle competition](kaggle_leaderboard.png)
+
+If the competition was live, I would achieve the 49th place. There is definitely still room for improvement, but this place would put me in the top 10% of the leaderboard. Not that bad, after all.
+
+# Towards Deployment
+
+Due to the time allowed for this challenge, the code has been developed for ease of exploration and experimentation, not for deployment. Nevertheless, there was always care so that all the features extracted were feasible and reallistic in a production environment, and the system could yield classifications of new instances with minor computational cost. To classify a new project instance based on the methods proposed in this notebook, an application would have to implement the following steps:
+
+1. Clean the given project instance data as done in this notebook.
+2. Extract the aditional features from the posting date and resources information of the given project.
+3. Extract the features based on previous outcomes of projects submitted by the same teacher/school. This would have to be done considering all the available historical data at the time of the prediction. For classifying a single new instance, this would correspond to no more than a few SELECT COUNT in the database.
+4. Extract the features related to the socio-economic data of the school's zip code area, as done in this notebook. The dataset I used for socio-economic data is open, updated every year, is extremely complete (nearly all ZIP codes in the US) and of high quality, so this wouldn't be an issue.
+5. Calculate the topic probabilities for the project essay and statement of needs. Fitting the topics to the existing corpus was computational expensive, but new instances could simply be assigned to the already fitted topic models, which is fast. I actually did this, as the topic models were only fitted with a sample of the data.
+6. Having the feature vector complete, the categorical variables would have to be one-hot-encoded, using the previosuly fitted one-hot-encoders, and then all the features would have to be standardized with the previously calculated standardization coefficients.
+7. Finally, the standardized feature vector could be fed to the previously fitted model for making the prediction.
+
+
+# Final remarks
+
+From the get-go, I knew this was an extremely challenging problem. Just by looking at the Kaggle score table, we can see that the first place was awarded to a submission with a ROC-AUC score of just 0.67, which can be considered as a [poor/fair performance](http://gim.unmc.edu/dxtests/roc3.htm). Half of the submissions are below 0.56, which is marginally better than random guess.
+
+Building a model with the data immediately available in the dataset (after cleaning and adequate preparation) confirmed the relatively low performance of the model. To try to improve the model's performance, I heavily invested in feature engineering, by (1) extracting additional features from the provided datasets, (2) extracting features from socio-economic data available online, and (3) applying text mining techniques to extract features from the projects' essays.
+
+Some of these features improved the model's performance, but even the best model yielded a relatively poor performance, with a relatively good true positive rate (0.4), but low precision (0.22), meaning that approximately only one in five projects predicted as exciting would actually become exciting. The model is thus modestly unreliable, and would naturally have limited uses in a production setting.
+
+## Future directions
+
+To try to improve upon these results, a significantly different approach could be experimented. Currently, I'm predicting whether a project is exciting or not based on the features associated with that project (binary classification). However, as stated in the Introduction, there are several criteria that must be met in order for a project to be considered exciting (fully funded, had donors leaving original messages, had donors referred by teachers, etc.). The dataset also includes this information, which is currently not being used. A different approach could be:
+
+1. Predict the probability of fullfilment of each of the criteria independently.
+2. Calculate the probability of a project being exciting based on those probabilities.
+
+Such an approach would also be more informative for the end user, as it would be more explicit about why a given project is being predicted as exciting or not.
+
+In parallel with this new approach, other topics deserve further work and investigation:
+
+1. Fine tune the models and experiment with a wider variety of models.
+2. Understand why the new features from population data and text mining barely improved the results. Experiment with non-linear models to see if this features can be leveraged that way.
+3. Experiment with feature selection and understand the importance of each feature in the dataset. This would also provide important information for the end user.
+
+# Bonus - DNNs
+
+As bonus, some experiments with Deep Neural Networks that amounted to nothing useful. Unfortunately, I did not have enough time to understand why the training of the neural network is mostly failing. The accuracy increases over the epochs, but the ROC-AUC score actually decreases, meaning that the neural network is likely getting biased towards negative predictions (by far the most common class). The class weights should have handled this problem, but apparently it's not working as expected. A different loss function might also be desirable in this case.
+
+```{python, eval=FALSE}
+from tensorflow.python.keras.callbacks import Callback
+class ROCMetric(Callback):
+    """
+    Custom metric to evaluate the ROC AUC at the end of each epoch in
+    the validation data
+    """
+    def __init__(self, validation_data=(), interval=1):
+        super().__init__()
+        self.interval = interval
+        self.X_val, self.y_val = validation_data
+
+    def on_epoch_end(self, epoch, logs={}):
+        if epoch % self.interval == 0:
+            y_pred = self.model.predict_proba(self.X_val, verbose=0)
+            score = roc_auc_score(self.y_val, y_pred)
+            logs['rocauc'] = score
+            print('ROC AUC: ' + str(score))
+```
+
+```{python, eval=FALSE}
+def fitDNN(X_train, y_train, X_test, y_test):
+    from tensorflow.python.keras.models import Sequential
+    from tensorflow.python.keras.layers import Dense, Dropout
+
+    # Initialise the ANN
+    ann = Sequential()
+    # input layer and first hidden layer
+    ann.add(Dense(100, kernel_initializer='glorot_uniform', activation='relu', input_dim=X_train.shape[1]))
+    ann.add(Dropout(rate=0.3))
+    # second hidden layer
+    ann.add(Dense(100, kernel_initializer='glorot_uniform', activation='relu'))
+    ann.add(Dropout(rate=0.3))
+    # output layer, only one output node: probability of being exciting
+    ann.add(Dense(1, kernel_initializer='glorot_uniform', activation='sigmoid'))
+    # compiling the ANN -- applying Stochastic Gradient Descent
+    ann.compile(optimizer='nadam', loss='binary_crossentropy', metrics=['accuracy'])
+    print(ann.summary())
+
+    roc = ROCMetric(validation_data=(X_test, y_test), interval=1)
+    # fitting the network to data
+    # using class weights since the data is largely imbalanced
+    from sklearn.utils import class_weight
+    class_w = dict(enumerate(class_weight.compute_class_weight('balanced', np.unique(y_train), y_train)))
+    h = ann.fit(X_train, y_train, batch_size=32, epochs=100, class_weight=class_w,
+                validation_data=(X_test,y_test), callbacks=[roc], verbose=2)
+    return ann, h
+```
+
+```{python, eval=FALSE}
+X_train, y_train, X_test, y_test, X_master = load_and_transform('feature_eng_nlp', split=0.2)
+ann, history = fitDNN(X_train, y_train, X_test, y_test)
+assessmodel(ann, X_test, y_test)
+```
+
+```
+Layer (type)                 Output Shape              Param #   
+=================================================================
+dense_1 (Dense)              (None, 100)               26200     
+_________________________________________________________________
+dropout_1 (Dropout)          (None, 100)               0         
+_________________________________________________________________
+dense_2 (Dense)              (None, 100)               10100     
+_________________________________________________________________
+dropout_2 (Dropout)          (None, 100)               0         
+_________________________________________________________________
+dense_3 (Dense)              (None, 1)                 101       
+=================================================================
+Total params: 36,401
+Trainable params: 36,401
+```
+
+```
+Confusion matrix:
+[[25158 23783]
+ [ 3102  4958]]
+True Positive Rate: 0.62
+False Positive Rate: 0.49
+Precision: 0.17
+ROC AUC score: 0.5860088624967633
+```
+
+![ROC-AUC score in the test data over the epochs](dnn_rocauc.png)
+
